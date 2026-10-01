@@ -119,6 +119,7 @@ from .._parsers import (
     _AsyncRESP2Parser,
     _AsyncRESP3Parser,
 )
+from .._parsers.socket import SERVER_CLOSED_CONNECTION_ERROR
 
 SYM_STAR = b"*"
 SYM_DOLLAR = b"$"
@@ -599,6 +600,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         "_reader",
         "_writer",
         "_parser",
+        "_close_event",
         "_active_read_timeout",
         "_connect_callbacks",
         "_buffer_cutoff",
@@ -718,6 +720,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         self.redis_connect_func = redis_connect_func
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
+        # Close waiter for the current connection generation. A fresh Event is
+        # created on every (re)connect so a close of the previous generation
+        # can never poison waiters on the new one; disconnect() sets it to
+        # wake every pending read/write with a consistent close error.
+        self._close_event: Optional[asyncio.Event] = None
         self._socket_read_size = socket_read_size
         self._active_read_timeout = None
         self._connect_callbacks: List[weakref.WeakMethod[ConnectCallbackT]] = []
@@ -782,9 +789,22 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         """
         Internal method to silently close the connection without waiting
         """
+        self._signal_close()
         if self._writer:
             self._writer.close()
             self._writer = self._reader = None
+
+    def _signal_close(self) -> None:
+        """Wake every task waiting on this connection generation.
+
+        The event object is intentionally left in place (set): waiters that
+        captured it still fire, and any late read/write on the closed
+        generation fails fast instead of touching a dead stream. The next
+        connect installs a fresh, unset event.
+        """
+        close_event = self._close_event
+        if close_event is not None and not close_event.is_set():
+            close_event.set()
 
     def __repr__(self):
         repr_args = ",".join((f"{k}={v}" for k, v in self.repr_pieces()))
@@ -920,6 +940,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
     ):
         if self.is_connected:
             return
+        # New connection generation: install a fresh close event so a close
+        # of the previous generation cannot poison waiters on this one.
+        self._close_event = asyncio.Event()
         # Track actual retry attempts for error reporting
         actual_retry_attempts = 0
 
@@ -1160,6 +1183,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         health_check_failed: bool = False,
     ) -> None:
         """Disconnects from the Redis server"""
+        # Wake pending readers/writers immediately with a consistent close
+        # error instead of letting them hang until their own timeout.
+        self._signal_close()
         # The server session is gone, so any HIMPORT fieldsets prepared on this
         # socket no longer exist; reset the tracking.
         self._reset_himport_state()
@@ -1253,13 +1279,69 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 self._send_ping, self._ping_failed, with_failure_count=True
             )
 
+    async def _wait_with_close(self, coro, operation: str):
+        """Await ``coro``, racing it against this generation's close event.
+
+        If the connection is closed while the operation is in flight, the
+        in-flight operation is cancelled and a consistent
+        ``ConnectionError`` is raised, so every pending read/write observes
+        the same close failure instead of hanging until its own timeout.
+        Helper tasks are always cancelled and drained before returning, so
+        no pending task is left behind.
+        """
+        close_event = self._close_event
+        if close_event is None:
+            return await coro
+        if close_event.is_set():
+            # Already-closed generation: fail fast without starting the I/O.
+            coro.close()
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        op_task = asyncio.ensure_future(coro)
+        close_task = asyncio.ensure_future(close_event.wait())
+        winner: Optional[asyncio.Task] = None
+        try:
+            done, _ = await asyncio.wait(
+                (op_task, close_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if op_task in done:
+                exc = op_task.exception()
+                if exc is None:
+                    # The operation genuinely completed; success wins even
+                    # if the connection closed at the same moment.
+                    winner = op_task
+                    return op_task.result()
+                if not close_event.is_set():
+                    # A genuine I/O failure unrelated to a close.
+                    winner = op_task
+                    raise exc
+            # The connection was closed while the operation was in flight
+            # (or the operation failed as a consequence of the close):
+            # report the consistent close error.
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        finally:
+            for task in (op_task, close_task):
+                if not task.done():
+                    task.cancel()
+            # Drain the loser(s) so no helper task is left pending and no
+            # "exception was never retrieved" warning is emitted.
+            for task in (op_task, close_task):
+                if task is winner:
+                    continue
+                if not task.done():
+                    with contextlib.suppress(
+                        asyncio.CancelledError, Exception
+                    ):
+                        await task
+                if task.done() and not task.cancelled():
+                    task.exception()  # retrieve, if any
+
     async def _send_packed_command(self, command: Iterable[bytes]) -> None:
         writer = self._writer
         if writer is None or writer.transport.is_closing():
             raise ConnectionError("Connection closed by the server before write")
         try:
             writer.writelines(command)
-            await writer.drain()
+            await self._wait_with_close(writer.drain(), "writing command")
         except (TypeError, AttributeError) as e:
             # CPython gh-136234 adds the missing connection-lost check in 3.13.10+
             # and 3.14.1+. Python 3.12, 3.13.0-3.13.9, and 3.14.0 can instead
@@ -1439,10 +1521,14 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         self, disable_decoding: bool = False, push_request: bool | None = False
     ):
         if check_protocol_version(self.protocol, 3):
-            return await self._parser.read_response(
+            coro = self._parser.read_response(
                 disable_decoding=disable_decoding, push_request=push_request
             )
-        return await self._parser.read_response(disable_decoding=disable_decoding)
+        else:
+            coro = self._parser.read_response(
+                disable_decoding=disable_decoding
+            )
+        return await self._wait_with_close(coro, "reading response")
 
     def pack_command(self, *args: EncodableT) -> List[bytes]:
         """Pack a series of arguments into the Redis protocol"""
