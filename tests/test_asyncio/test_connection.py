@@ -656,13 +656,13 @@ async def test_connection_disconect_race(parser_class, connect_args):
     """
     This test reproduces the case in issue #2349
     where a connection is closed while the parser is reading to feed the
-    internal buffer.The stream `read()` will succeed, but when it returns,
-    another task has already called `disconnect()` and is waiting for
-    close to finish.  When we attempts to feed the buffer, we will fail
-    since the buffer is no longer there.
+    internal buffer.
 
-    This test verifies that a read in progress can finish even
-    if the `disconnect()` method is called.
+    The close waiter ensures that a read in flight is aborted immediately
+    with a consistent ConnectionError when disconnect() is called, rather
+    than being allowed to finish. This guarantees every pending read/write
+    observes the same close error (no inconsistent results depending on
+    timing) and leaves no orphaned tasks.
     """
     if parser_class == _AsyncHiredisParser and not HIREDIS_AVAILABLE:
         pytest.skip("Hiredis not available")
@@ -728,8 +728,198 @@ async def test_connection_disconect_race(parser_class, connect_args):
         ):
             await conn.connect()
 
-    vals = await asyncio.gather(do_read(), do_close())
-    assert vals == [b"Hello, World!", None]
+    vals = await asyncio.gather(do_read(), do_close(), return_exceptions=True)
+    # disconnect() must complete cleanly
+    assert vals[1] is None
+    # the read in flight must be aborted with a consistent ConnectionError
+    assert isinstance(vals[0], ConnectionError), (
+        f"expected ConnectionError, got {type(vals[0]).__name__}: {vals[0]}"
+    )
+
+
+class _HangingStreamReader:
+    """A fake StreamReader whose read/readline/readexactly hang until released."""
+
+    def __init__(self):
+        self._buf = b""
+        self._eof = False
+        self._waiters: list = []
+        self.read_calls = 0
+
+    async def _hang(self):
+        w = asyncio.get_running_loop().create_future()
+        self._waiters.append(w)
+        try:
+            return await w
+        finally:
+            self._waiters.remove(w)
+
+    async def readexactly(self, n):
+        self.read_calls += 1
+        return await self._hang()
+
+    async def readline(self):
+        self.read_calls += 1
+        return await self._hang()
+
+    async def read(self, n=-1):
+        self.read_calls += 1
+        return await self._hang()
+
+    def at_eof(self):
+        return self._eof
+
+    @property
+    def _buffer(self):
+        return self._buf
+
+    @_buffer.setter
+    def _buffer(self, value):
+        self._buf = value
+
+
+class _HangingStreamWriter:
+    def __init__(self):
+        self.transport = mock.Mock()
+        self.transport.is_closing.return_value = False
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+        self.transport.is_closing.return_value = True
+
+    async def wait_closed(self):
+        pass
+
+    async def drain(self):
+        w = asyncio.get_running_loop().create_future()
+        await w
+
+    def writelines(self, data):
+        pass
+
+    def get_extra_info(self, name):
+        return None
+
+
+def _make_fake_connection(parser_class=_AsyncRESP3Parser):
+    """Wire a Connection up to a hanging fake reader/writer without a real socket."""
+    conn = Connection(host="localhost", port=6379, parser_class=parser_class)
+    reader = _HangingStreamReader()
+    writer = _HangingStreamWriter()
+    conn._reader = reader
+    conn._writer = writer
+    conn._reset_close_waiter()
+    conn._parser.on_connect(conn)
+    return conn, reader, writer
+
+
+@pytest.mark.parametrize(
+    "parser_class",
+    [_AsyncRESP2Parser, _AsyncRESP3Parser, _AsyncHiredisParser],
+    ids=["AsyncRESP2Parser", "AsyncRESP3Parser", "AsyncHiredisParser"],
+)
+async def test_close_waiter_aborts_pending_read_immediately(parser_class):
+    """A pending read is woken up immediately with ConnectionError on close."""
+    if parser_class == _AsyncHiredisParser and not HIREDIS_AVAILABLE:
+        pytest.skip("Hiredis not available")
+
+    conn, reader, writer = _make_fake_connection(parser_class)
+
+    read_task = asyncio.ensure_future(conn.read_response())
+    await asyncio.sleep(0.05)
+    assert not read_task.done(), "read should be hanging"
+    assert reader.read_calls >= 1
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await conn.disconnect()
+    await asyncio.sleep(0.05)
+    elapsed = loop.time() - start
+
+    assert read_task.done(), "read should be done after disconnect"
+    exc = read_task.exception()
+    assert isinstance(exc, ConnectionError), (
+        f"expected ConnectionError, got {type(exc).__name__}: {exc}"
+    )
+    assert elapsed < 0.5, "read should be woken up promptly, not after a long timeout"
+
+
+@pytest.mark.parametrize(
+    "parser_class",
+    [_AsyncRESP2Parser, _AsyncRESP3Parser, _AsyncHiredisParser],
+    ids=["AsyncRESP2Parser", "AsyncRESP3Parser", "AsyncHiredisParser"],
+)
+async def test_close_waiter_reconnect_not_polluted_by_old_close(parser_class):
+    """A new connection after reconnect is not polluted by an old close event."""
+    if parser_class == _AsyncHiredisParser and not HIREDIS_AVAILABLE:
+        pytest.skip("Hiredis not available")
+
+    conn, reader1, writer1 = _make_fake_connection(parser_class)
+
+    old_read = asyncio.ensure_future(conn.read_response())
+    await asyncio.sleep(0.05)
+    assert not old_read.done()
+
+    await conn.disconnect()
+    await asyncio.sleep(0.05)
+    assert old_read.done()
+    assert isinstance(old_read.exception(), ConnectionError)
+
+    # Reconnect with brand-new fakes (a new connection generation).
+    reader2 = _HangingStreamReader()
+    writer2 = _HangingStreamWriter()
+    conn._reader = reader2
+    conn._writer = writer2
+    conn._reset_close_waiter()
+    conn._parser.on_connect(conn)
+
+    assert conn.is_connected
+    assert conn._parser._stream is reader2
+    assert conn._close_waiter is not None and not conn._close_waiter.done()
+
+    # A new read on the new connection must NOT be woken up by the old close.
+    new_read = asyncio.ensure_future(conn.read_response())
+    await asyncio.sleep(0.05)
+    assert not new_read.done(), "new read should hang and not be polluted by old close"
+
+    # Closing the new connection must wake the new read with a close error.
+    await conn.disconnect()
+    await asyncio.sleep(0.05)
+    assert new_read.done()
+    assert isinstance(new_read.exception(), ConnectionError)
+
+
+@pytest.mark.parametrize(
+    "parser_class",
+    [_AsyncRESP2Parser, _AsyncRESP3Parser, _AsyncHiredisParser],
+    ids=["AsyncRESP2Parser", "AsyncRESP3Parser", "AsyncHiredisParser"],
+)
+async def test_close_waiter_leaves_no_pending_tasks(parser_class):
+    """No orphaned tasks remain after close wakes up pending reads."""
+    if parser_class == _AsyncHiredisParser and not HIREDIS_AVAILABLE:
+        pytest.skip("Hiredis not available")
+
+    conn, reader, writer = _make_fake_connection(parser_class)
+
+    reads = [asyncio.ensure_future(conn.read_response()) for _ in range(3)]
+    await asyncio.sleep(0.05)
+    for r in reads:
+        assert not r.done()
+
+    await conn.disconnect()
+    await asyncio.sleep(0.1)
+
+    for r in reads:
+        assert r.done(), "all reads should be done after close"
+        assert isinstance(r.exception(), ConnectionError)
+
+    pending = [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done() and t is not asyncio.current_task()
+    ]
+    assert len(pending) == 0, f"expected no pending tasks, got {len(pending)}"
 
 
 @pytest.mark.fixed_client

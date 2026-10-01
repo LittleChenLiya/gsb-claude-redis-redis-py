@@ -321,6 +321,9 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
 
         self._reader = hiredis.Reader(**kwargs)
         self._connected = True
+        # Pick up this connection generation's close waiter so in-flight reads
+        # can be aborted if the connection closes.
+        self._close_waiter = getattr(connection, "_close_waiter", None)
 
         try:
             self._hiredis_PushNotificationType = getattr(
@@ -360,7 +363,7 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
         return bool(self._stream._buffer)
 
     async def read_from_socket(self):
-        buffer = await self._stream.read(self._read_size)
+        buffer = await self._await_io(self._stream.read(self._read_size))
         if not buffer or not isinstance(buffer, bytes):
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
         self._reader.feed(buffer)

@@ -119,6 +119,7 @@ from .._parsers import (
     _AsyncRESP2Parser,
     _AsyncRESP3Parser,
 )
+from .._parsers.socket import SERVER_CLOSED_CONNECTION_ERROR
 
 SYM_STAR = b"*"
 SYM_DOLLAR = b"$"
@@ -604,6 +605,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         "_buffer_cutoff",
         "_lock",
         "_socket_read_size",
+        "_close_waiter",
         "__dict__",
     )
 
@@ -724,6 +726,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         self._buffer_cutoff = 6000
         self._re_auth_token: Optional[TokenInterface] = None
         self._should_reconnect = False
+        # Per-generation close waiter. A fresh future is created on each
+        # connect (see _reset_close_waiter) and resolved on disconnect, so
+        # in-flight reads/writes can abort immediately with a consistent
+        # close error. None until the first connect.
+        self._close_waiter: Optional[asyncio.Future] = None
 
         try:
             p = int(protocol)
@@ -929,6 +936,10 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             return self.disconnect(error=error, failure_count=failure_count)
 
         try:
+            # A fresh close waiter for this connection generation. It must
+            # exist before _connect() so that on_connect() can hand it to the
+            # parser and any in-flight I/O can be aborted on close.
+            self._reset_close_waiter()
             if retry_socket_connect:
                 await self.retry.call_with_retry(
                     lambda: self._connect(),
@@ -1000,6 +1011,60 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
 
     def reset_should_reconnect(self):
         self._should_reconnect = False
+
+    def _reset_close_waiter(self) -> asyncio.Future:
+        """
+        Create a fresh close waiter for a new connection generation.
+
+        Called at the start of each connect attempt. The returned future is
+        resolved by :meth:`_resolve_close_waiter` when the connection closes,
+        waking up every in-flight read/write that is racing against it. Because
+        each connect creates a new future, operations belonging to an old
+        generation can never be woken up by a close event from a new
+        connection (and vice versa).
+        """
+        self._close_waiter = asyncio.get_running_loop().create_future()
+        return self._close_waiter
+
+    def _resolve_close_waiter(self) -> None:
+        """
+        Resolve the current generation's close waiter.
+
+        Wakes up all in-flight reads/writes racing against it with a
+        consistent close error. Safe to call multiple times and when no
+        waiter exists.
+        """
+        waiter = self._close_waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+    async def _await_close_waiter(self, awaitable):
+        """
+        Await an I/O operation, but abort immediately with a ConnectionError
+        if this connection closes while the I/O is in flight.
+
+        Races the I/O against the per-generation close waiter. When the
+        connection closes, the waiter is resolved and the I/O task is
+        cancelled so no orphaned tasks remain and every pending write
+        observes the same close error.
+        """
+        close_waiter = self._close_waiter
+        if close_waiter is None or close_waiter.done():
+            return await awaitable
+        io_task = asyncio.ensure_future(awaitable)
+        try:
+            done, _ = await asyncio.wait(
+                {io_task, close_waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            io_task.cancel()
+            await asyncio.gather(io_task, return_exceptions=True)
+            raise
+        if close_waiter in done:
+            io_task.cancel()
+            await asyncio.gather(io_task, return_exceptions=True)
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        return io_task.result()
 
     @abstractmethod
     async def _connect(self):
@@ -1170,8 +1235,18 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         if asyncio.current_task() is None:
             self._parser.on_disconnect()
             self.reset_should_reconnect()
+            # Wake up any in-flight reads/writes with a consistent close
+            # error, matching the normal disconnect path.
+            self._resolve_close_waiter()
             self._close()
             return
+
+        # Resolve the close waiter first so every in-flight read/write is
+        # woken up immediately with a consistent close error, before we close
+        # the underlying writer. This also ensures a reconnect can never be
+        # polluted by an old close event: the waiter is per-generation and a
+        # new one is created on the next connect.
+        self._resolve_close_waiter()
 
         try:
             async with async_timeout(self.socket_connect_timeout):
@@ -1259,7 +1334,10 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             raise ConnectionError("Connection closed by the server before write")
         try:
             writer.writelines(command)
-            await writer.drain()
+            # Race the drain against the close waiter so a close that happens
+            # while the write is in flight aborts immediately with a
+            # consistent ConnectionError instead of hanging on a dead socket.
+            await self._await_close_waiter(writer.drain())
         except (TypeError, AttributeError) as e:
             # CPython gh-136234 adds the missing connection-lost check in 3.13.10+
             # and 3.14.1+. Python 3.12, 3.13.0-3.13.9, and 3.14.0 can instead

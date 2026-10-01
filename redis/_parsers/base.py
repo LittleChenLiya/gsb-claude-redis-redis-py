@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from asyncio import IncompleteReadError, StreamReader
@@ -172,7 +173,7 @@ class _RESPBase(BaseParser):
 class AsyncBaseParser(BaseParser):
     """Base parsing class for the python-backed async parser"""
 
-    __slots__ = "_stream", "_read_size", "_connected"
+    __slots__ = "_stream", "_read_size", "_connected", "_close_waiter"
 
     def __init__(self, socket_read_size: int):
         self._stream: Optional[StreamReader] = None
@@ -183,6 +184,42 @@ class AsyncBaseParser(BaseParser):
         # ConnectionError. A parser that has never connected would otherwise
         # raise AttributeError from those guards, which no retry layer acts on.
         self._connected: bool = False
+        # Per-generation close waiter. The connection resolves this future when
+        # it closes, so in-flight reads can abort immediately with a consistent
+        # ConnectionError instead of hanging on a dead stream. Refreshed on each
+        # connect in on_connect(); see _await_io().
+        self._close_waiter: Optional["asyncio.Future"] = None
+
+    async def _await_io(self, io_awaitable):
+        """
+        Await an I/O operation, but abort immediately with a ConnectionError
+        if the connection closes while the I/O is in flight.
+
+        Races the I/O against the connection's per-generation close waiter. When
+        the connection closes, the waiter is resolved and the I/O task is
+        cancelled so no orphaned tasks remain and every pending read observes
+        the same close error. Reads that start after the waiter was resolved
+        (i.e. after disconnect) also fail fast here.
+        """
+        close_waiter = self._close_waiter
+        if close_waiter is None or close_waiter.done():
+            return await io_awaitable
+        io_task = asyncio.ensure_future(io_awaitable)
+        try:
+            done, _ = await asyncio.wait(
+                {io_task, close_waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            io_task.cancel()
+            await asyncio.gather(io_task, return_exceptions=True)
+            raise
+        if close_waiter in done:
+            # The connection closed while the I/O was in flight. Cancel the
+            # orphaned I/O task and surface a consistent close error.
+            io_task.cancel()
+            await asyncio.gather(io_task, return_exceptions=True)
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        return io_task.result()
 
     @deprecated_function(
         version="8.0.0", reason="Use can_read() instead", name="can_read_destructive"
@@ -535,6 +572,9 @@ class _AsyncRESPBase(AsyncBaseParser):
         self.encoder = connection.encoder
         self._clear()
         self._connected = True
+        # Pick up this connection generation's close waiter so in-flight reads
+        # can be aborted if the connection closes. Refreshed on every reconnect.
+        self._close_waiter = getattr(connection, "_close_waiter", None)
 
     def on_disconnect(self):
         """Called when the stream disconnects"""
@@ -580,7 +620,9 @@ class _AsyncRESPBase(AsyncBaseParser):
         else:
             tail = self._buffer[self._pos :]
             try:
-                data = await self._stream.readexactly(want - len(tail))
+                data = await self._await_io(
+                    self._stream.readexactly(want - len(tail))
+                )
             except IncompleteReadError as error:
                 raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from error
             result = (tail + data)[:-2]
@@ -598,7 +640,7 @@ class _AsyncRESPBase(AsyncBaseParser):
             result = self._buffer[self._pos : found]
         else:
             tail = self._buffer[self._pos :]
-            data = await self._stream.readline()
+            data = await self._await_io(self._stream.readline())
             if not data.endswith(b"\r\n"):
                 raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
             result = (tail + data)[:-2]
