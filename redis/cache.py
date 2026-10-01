@@ -44,11 +44,17 @@ class CacheEntry:
         cache_value: bytes,
         status: CacheEntryStatus,
         connection_ref,
+        generation: int = 0,
     ):
         self.cache_key = cache_key
         self.cache_value = cache_value
         self.status = status
         self.connection_ref = connection_ref
+        # The cache generation in which this entry was created. Entries tagged with a
+        # generation older than the cache's current generation are stale: they must
+        # never be served as cache hits, because the connection that produced them may
+        # have gone away and the value may no longer reflect what the server holds.
+        self.generation = generation
 
     def __hash__(self):
         return hash(
@@ -131,6 +137,30 @@ class CacheInterface(ABC):
     def size(self) -> int:
         pass
 
+    @property
+    @abstractmethod
+    def generation(self) -> int:
+        """
+        The current cache generation.
+
+        The generation is advanced whenever the connection that backs this cache is
+        torn down (a disconnect/reconnect cycle). Cache entries are tagged with the
+        generation they were created in, so a hit can never serve a value produced by
+        a previous generation.
+        """
+        pass
+
+    @abstractmethod
+    def next_generation(self) -> int:
+        """
+        Advance the cache generation and return the new value.
+
+        Called by the connection proxy on disconnect. Every entry created before this
+        point becomes stale: it stays in the collection until lazily deleted on a
+        lookup, but it can never be returned as a cache hit.
+        """
+        pass
+
     @abstractmethod
     def get(self, key: CacheKey) -> Union[CacheEntry, None]:
         pass
@@ -165,6 +195,10 @@ class DefaultCache(CacheInterface):
         self._cache_config = cache_config
         self._eviction_policy = self._cache_config.get_eviction_policy().value()
         self._eviction_policy.cache = self
+        # Monotonically increasing counter, advanced on disconnect. Entries are tagged
+        # with the generation they were created in; a lookup only serves entries whose
+        # generation matches the current one.
+        self._generation = 0
 
     @property
     def collection(self) -> OrderedDict:
@@ -182,9 +216,23 @@ class DefaultCache(CacheInterface):
     def size(self) -> int:
         return len(self._cache)
 
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def next_generation(self) -> int:
+        self._generation += 1
+        return self._generation
+
     def set(self, entry: CacheEntry) -> bool:
         if not self.is_cachable(entry.cache_key):
             return False
+
+        # Tag the entry with the generation it is being stored in. A response that
+        # arrives after a reconnect is never re-cached (the lookup in read_response
+        # drops it as cross-generation), so every entry that reaches here belongs to
+        # the current generation.
+        entry.generation = self._generation
 
         self._cache[entry.cache_key] = entry
         self._eviction_policy.touch(entry.cache_key)
@@ -195,6 +243,13 @@ class DefaultCache(CacheInterface):
         entry = self._cache.get(key, None)
 
         if entry is None:
+            return None
+
+        # A cache hit must never cross a generation boundary: an entry produced before
+        # a reconnect may describe a state the server no longer holds. Drop it lazily
+        # and report a miss so the caller re-fetches from the server.
+        if entry.generation != self._generation:
+            self._cache.pop(key, None)
             return None
 
         self._eviction_policy.touch(key)
@@ -271,6 +326,13 @@ class CacheProxy(CacheInterface):
     @property
     def size(self) -> int:
         return self._cache.size
+
+    @property
+    def generation(self) -> int:
+        return self._cache.generation
+
+    def next_generation(self) -> int:
+        return self._cache.next_generation()
 
     def get(self, key: CacheKey) -> Union[CacheEntry, None]:
         return self._cache.get(key)

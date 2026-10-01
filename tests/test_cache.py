@@ -332,7 +332,7 @@ class TestCache:
         indirect=True,
     )
     @pytest.mark.onlynoncluster
-    def test_cache_clears_on_disconnect(self, r, cache):
+    def test_cache_generation_advances_on_disconnect(self, r, cache):
         cache = r.get_cache()
         # add key to redis
         r.set("foo", "bar")
@@ -345,10 +345,18 @@ class TestCache:
             ).cache_value
             == b"bar"
         )
+        assert cache.generation == 0
         # Force disconnection
         r.connection_pool.get_connection().disconnect()
-        # Make sure cache is empty
-        assert cache.size == 0
+        # A reconnect starts a new generation; the old entry is stale and must no
+        # longer be served as a cache hit.
+        assert cache.generation == 1
+        assert (
+            cache.get(
+                CacheKey(command="GET", redis_keys=("foo",), redis_args=("GET", "foo"))
+            )
+            is None
+        )
 
     @pytest.mark.parametrize(
         "r",
@@ -821,7 +829,7 @@ class TestClusterCache:
         indirect=True,
     )
     @pytest.mark.onlycluster
-    def test_cache_clears_on_disconnect(self, r, r2):
+    def test_cache_generation_advances_on_disconnect(self, r, r2):
         cache = r.nodes_manager.get_node_from_slot(12000).redis_connection.get_cache()
         # add key to redis
         r.set("foo", "bar")
@@ -834,12 +842,20 @@ class TestClusterCache:
             ).cache_value
             == b"bar"
         )
+        assert cache.generation == 0
         # Force disconnection
         r.nodes_manager.get_node_from_slot(
             12000
         ).redis_connection.connection_pool.get_connection().disconnect()
-        # Make sure cache is empty
-        assert cache.size == 0
+        # A reconnect starts a new generation; the old entry is stale and must no
+        # longer be served as a cache hit.
+        assert cache.generation == 1
+        assert (
+            cache.get(
+                CacheKey(command="GET", redis_keys=("foo",), redis_args=("GET", "foo"))
+            )
+            is None
+        )
 
     @pytest.mark.parametrize(
         "r",
@@ -1145,7 +1161,7 @@ class TestSentinelCache:
         indirect=True,
     )
     @pytest.mark.onlynoncluster
-    def test_cache_clears_on_disconnect(self, master, cache):
+    def test_cache_generation_advances_on_disconnect(self, master, cache):
         cache = master.get_cache()
         # add key to redis
         master.set("foo", "bar")
@@ -1158,10 +1174,18 @@ class TestSentinelCache:
             ).cache_value
             == b"bar"
         )
+        assert cache.generation == 0
         # Force disconnection
         master.connection_pool.get_connection().disconnect()
-        # Make sure cache_data is empty
-        assert cache.size == 0
+        # A reconnect starts a new generation; the old entry is stale and must no
+        # longer be served as a cache hit.
+        assert cache.generation == 1
+        assert (
+            cache.get(
+                CacheKey(command="GET", redis_keys=("foo",), redis_args=("GET", "foo"))
+            )
+            is None
+        )
 
 
 @pytest.mark.onlynoncluster

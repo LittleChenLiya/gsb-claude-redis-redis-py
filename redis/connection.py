@@ -1843,6 +1843,11 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         self._cache_lock = threading.RLock()
         self._current_command_cache_key = None
         self._current_options = None
+        # The cache generation this connection's tracking session belongs to. Recorded
+        # when CLIENT TRACKING is enabled (on connect) and checked on every invalidation
+        # push: a push produced for a previous tracking session must not be allowed to
+        # evict entries that a reconnect has since made current.
+        self._tracking_generation = self._cache.generation
         self.register_connect_callback(self._enable_tracking_callback)
 
         if isinstance(self._conn, MaintNotificationsAbstractConnection):
@@ -1923,7 +1928,13 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def disconnect(self, *args, **kwargs):
         with self._cache_lock:
-            self._cache.flush()
+            # A reconnect starts a new tracking session. Advance the cache generation so
+            # that every entry produced before the reconnect becomes stale: it stays in
+            # the collection until lazily deleted on a lookup, but it can never be served
+            # as a cache hit, and invalidation pushes that arrive late for the old session
+            # are discarded. This replaces the former full flush, which discarded entries
+            # that other still-alive connections in the pool could otherwise keep using.
+            self._cache.next_generation()
         self._conn.disconnect(*args, **kwargs)
 
     def check_health(self):
@@ -2234,6 +2245,10 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         conn.send_command("CLIENT", "TRACKING", "ON")
         conn.read_response()
         conn._parser.set_invalidation_push_handler(self._on_invalidation_callback)
+        # Record the generation this tracking session starts in. Invalidation pushes
+        # that arrive on this connection belong to this session; if the cache generation
+        # has since advanced (a reconnect happened), they are late and must be discarded.
+        self._tracking_generation = self._cache.generation
 
     def _process_pending_invalidations(self):
         while self.can_read():
@@ -2246,6 +2261,14 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def _on_invalidation_callback(self, data: List[Union[str, Optional[List[bytes]]]]):
         with self._cache_lock:
+            # A reconnect may have advanced the cache generation while this connection
+            # was still holding a tracking session from before it. An invalidation push
+            # produced for that old session is late: applying it would evict entries that
+            # the reconnect has since made current, so drop it. Invalidation pushes for
+            # the current session (the common case) still take effect.
+            if self._tracking_generation != self._cache.generation:
+                return
+
             # Flush cache when DB flushed on server-side
             if data[1] is None:
                 self._cache.flush()

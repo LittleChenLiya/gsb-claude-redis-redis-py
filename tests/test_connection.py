@@ -1348,7 +1348,7 @@ class TestUnitConnectionPool:
 
 @pytest.mark.fixed_client
 class TestUnitCacheProxyConnection:
-    def test_clears_cache_on_disconnect(self, mock_connection, cache_conf):
+    def test_generation_advances_on_disconnect(self, mock_connection, cache_conf):
         cache = DefaultCache(CacheConfig(max_size=10))
         cache_key = CacheKey(
             command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
@@ -1363,6 +1363,7 @@ class TestUnitCacheProxyConnection:
             )
         )
         assert cache.get(cache_key).cache_value == b"bar"
+        assert cache.generation == 0
 
         mock_connection.disconnect.return_value = None
         mock_connection.retry = "mock"
@@ -1377,7 +1378,10 @@ class TestUnitCacheProxyConnection:
         )
         proxy_connection.disconnect()
 
-        assert len(cache.collection) == 0
+        # Disconnect advances the generation; the old entry is stale and must no
+        # longer be served as a cache hit.
+        assert cache.generation == 1
+        assert cache.get(cache_key) is None
 
     def test_cacheable_command_without_keys_bypasses_the_cache(
         self, mock_cache, mock_connection
