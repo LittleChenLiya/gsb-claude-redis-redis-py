@@ -280,6 +280,136 @@ class AsyncMaintNotificationsAbstractRedisCluster:
             node.connection_kwargs.update(maint_kwargs)
 
 
+class RedirectTracker:
+    """
+    Tracks MOVED and ASK redirects for a single cluster request.
+
+    A new tracker is created per ``execute_command`` call and populated as the
+    request follows MOVED/ASK redirects. It records only node addresses and
+    slot ids — never credentials, command payloads, or any authentication
+    material — so the report is safe to log or expose.
+
+    Usage::
+
+        tracker = RedirectTracker()
+        result = await r.execute_command("GET", "key", redirect_tracker=tracker)
+        print(tracker.report())
+    """
+
+    MOVED = "MOVED"
+    ASK = "ASK"
+
+    __slots__ = ("_events", "_start_time")
+
+    def __init__(self) -> None:
+        self._events: List[Dict[str, Any]] = []
+        self._start_time = time.monotonic()
+
+    def record_moved(
+        self,
+        source_node: str,
+        destination_node: str,
+        slot_id: int,
+        circular: bool = False,
+    ) -> None:
+        """
+        Record a MOVED redirect.
+
+        :param source_node: name (``host:port``) of the node that returned MOVED
+        :param destination_node: name (``host:port``) of the redirect target
+        :param slot_id: the hash slot the redirect pertains to
+        :param circular: True when the MOVED points back at the same node
+        """
+        self._events.append(
+            {
+                "kind": self.MOVED,
+                "source_node": source_node,
+                "destination_node": destination_node,
+                "slot_id": slot_id,
+                "timestamp": time.monotonic() - self._start_time,
+                "circular": circular,
+            }
+        )
+
+    def record_ask(
+        self,
+        source_node: str,
+        destination_node: str,
+        slot_id: int,
+    ) -> None:
+        """
+        Record an ASK redirect.
+
+        :param source_node: name (``host:port``) of the node that returned ASK
+        :param destination_node: name (``host:port``) of the redirect target
+        :param slot_id: the hash slot the redirect pertains to
+        """
+        self._events.append(
+            {
+                "kind": self.ASK,
+                "source_node": source_node,
+                "destination_node": destination_node,
+                "slot_id": slot_id,
+                "timestamp": time.monotonic() - self._start_time,
+                "circular": False,
+            }
+        )
+
+    @property
+    def events(self) -> List[Dict[str, Any]]:
+        """All recorded redirect events, in order."""
+        return list(self._events)
+
+    @property
+    def moved_events(self) -> List[Dict[str, Any]]:
+        """Only MOVED events."""
+        return [e for e in self._events if e["kind"] == self.MOVED]
+
+    @property
+    def ask_events(self) -> List[Dict[str, Any]]:
+        """Only ASK events."""
+        return [e for e in self._events if e["kind"] == self.ASK]
+
+    @property
+    def circular_events(self) -> List[Dict[str, Any]]:
+        """Only circular MOVED events (redirect points back to the same node)."""
+        return [e for e in self._events if e["circular"]]
+
+    @property
+    def moved_count(self) -> int:
+        return len(self.moved_events)
+
+    @property
+    def ask_count(self) -> int:
+        return len(self.ask_events)
+
+    @property
+    def circular_count(self) -> int:
+        return len(self.circular_events)
+
+    def report(self) -> Dict[str, Any]:
+        """
+        Return a serializable report of the redirect tracking.
+
+        Contains only redirect metadata (node names, slot ids, timestamps).
+        No credentials or command payloads are included.
+        """
+        return {
+            "total_redirects": len(self._events),
+            "moved_count": self.moved_count,
+            "ask_count": self.ask_count,
+            "circular_count": self.circular_count,
+            "events": self.events,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"RedirectTracker(total={len(self._events)}, "
+            f"moved={self.moved_count}, ask={self.ask_count}, "
+            f"circular={self.circular_count})"
+        )
+
+
 class RedisCluster(
     AbstractRedis,
     AbstractRedisCluster,
@@ -458,6 +588,7 @@ class RedisCluster(
         "reinitialize_steps",
         "response_callbacks",
         "result_callbacks",
+        "last_redirect_tracker",
     )
 
     @deprecated_args(
@@ -691,6 +822,10 @@ class RedisCluster(
         self.load_balancing_strategy = load_balancing_strategy
         self.reinitialize_steps = reinitialize_steps
         self.reinitialize_counter = 0
+        # Redirect tracker for the most recent execute_command call. Populated
+        # on every request (a fresh tracker is created per call); None only
+        # before the first command runs.
+        self.last_redirect_tracker: Optional[RedirectTracker] = None
 
         # For backward compatibility, mapping from existing policies to new one
         self._command_flags_mapping: dict[str, Union[RequestPolicy, ResponsePolicy]] = {
@@ -1338,7 +1473,12 @@ class RedisCluster(
             error=error,
         )
 
-    async def execute_command(self, *args: EncodableT, **kwargs: Any) -> Any:
+    async def execute_command(
+        self,
+        *args: EncodableT,
+        redirect_tracker: Optional["RedirectTracker"] = None,
+        **kwargs: Any,
+    ) -> Any:
         """
         Execute a raw command on the appropriate cluster node or target_nodes.
 
@@ -1347,6 +1487,12 @@ class RedisCluster(
 
         :param args:
             | Raw command args
+        :param redirect_tracker:
+            | Optional :class:`~.RedirectTracker` that will be populated with
+              every MOVED/ASK redirect followed while serving this request.
+              When omitted, a fresh tracker is created and exposed as
+              :attr:`last_redirect_tracker` after the call. The tracker records
+              only node names and slot ids — never credentials.
         :param kwargs:
 
             - target_nodes: :attr:`NODE_FLAGS` or :class:`~.ClusterNode`
@@ -1359,6 +1505,11 @@ class RedisCluster(
         target_nodes = []
         target_nodes_specified = False
         retry_attempts = self.retry.get_retries()
+
+        # The tracker is consumed here, never forwarded to the connection.
+        if redirect_tracker is None:
+            redirect_tracker = RedirectTracker()
+        self.last_redirect_tracker = redirect_tracker
 
         passed_targets = kwargs.pop("target_nodes", None)
         if (
@@ -1409,7 +1560,9 @@ class RedisCluster(
 
                 if len(target_nodes) == 1:
                     # Return the processed result
-                    ret = await self._execute_command(target_nodes[0], *args, **kwargs)
+                    ret = await self._execute_command(
+                        target_nodes[0], *args, redirect_tracker=redirect_tracker, **kwargs
+                    )
                     if command in self.result_callbacks:
                         ret = self.result_callbacks[command](
                             command, {target_nodes[0].name: ret}, **kwargs
@@ -1422,7 +1575,9 @@ class RedisCluster(
                     values = await asyncio.gather(
                         *(
                             asyncio.create_task(
-                                self._execute_command(node, *args, **kwargs)
+                                self._execute_command(
+                                    node, *args, redirect_tracker=redirect_tracker, **kwargs
+                                )
                             )
                             for node in target_nodes
                         )
@@ -1472,7 +1627,11 @@ class RedisCluster(
                     raise e
 
     async def _execute_command(
-        self, target_node: "ClusterNode", *args: Union[KeyT, EncodableT], **kwargs: Any
+        self,
+        target_node: "ClusterNode",
+        *args: Union[KeyT, EncodableT],
+        redirect_tracker: Optional["RedirectTracker"] = None,
+        **kwargs: Any,
     ) -> Any:
         asking = moved = False
         redirect_addr = None
@@ -1608,6 +1767,17 @@ class RedisCluster(
                 else:
                     await self.nodes_manager.move_slot(e)
                 moved = True
+                # Record the MOVED redirect. A MOVED that points back at the
+                # node that returned it is circular (the slot's primary is
+                # already the redirect target); move_slot() is a no-op there.
+                if redirect_tracker is not None:
+                    dest_name = get_node_name(host=e.host, port=e.port)
+                    redirect_tracker.record_moved(
+                        source_node=target_node.name,
+                        destination_node=dest_name,
+                        slot_id=e.slot_id,
+                        circular=target_node.name == dest_name,
+                    )
                 await self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
@@ -1621,6 +1791,15 @@ class RedisCluster(
             except AskError as e:
                 redirect_addr = get_node_name(host=e.host, port=e.port)
                 asking = True
+                # Record the ASK redirect. ASK is a one-shot forwarding hint
+                # and never updates the slots cache (unlike MOVED), so the
+                # tracker keeps ASK and MOVED strictly separate.
+                if redirect_tracker is not None:
+                    redirect_tracker.record_ask(
+                        source_node=target_node.name,
+                        destination_node=redirect_addr,
+                        slot_id=e.slot_id,
+                    )
                 await self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
