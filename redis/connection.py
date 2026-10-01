@@ -1843,6 +1843,24 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         self._cache_lock = threading.RLock()
         self._current_command_cache_key = None
         self._current_options = None
+        # Per-connection invalidation generation.
+        #
+        # Each time this connection finishes (re)connecting it moves to a fresh
+        # generation: the value starts at 0 and the tracking connect callback
+        # advances it before any reply can be cached. An invalidation message
+        # handler is bound to the generation of the socket it was installed on; a
+        # message that arrives late - left buffered from the pre-disconnect socket
+        # and only parsed after the reconnect - therefore carries a stale generation
+        # and is dropped, while invalidations delivered by the currently connected
+        # socket keep taking effect.
+        #
+        # The cache itself keeps a generation shared by all connections (see
+        # ``DefaultCache.invalidation_generation``); it is advanced - and the cache
+        # flushed - whenever a tracked connection disconnects, since the server-side
+        # tracking registration backing the learned values is gone. Entries are
+        # stamped with that cache-wide generation, so a cache hit cannot serve a
+        # value learned across a disconnect/reconnect boundary.
+        self._invalidation_generation = 0
         self.register_connect_callback(self._enable_tracking_callback)
 
         if isinstance(self._conn, MaintNotificationsAbstractConnection):
@@ -1923,7 +1941,16 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def disconnect(self, *args, **kwargs):
         with self._cache_lock:
+            # Flush every learned value (the tracking registration that backed it
+            # is going away) and advance the cache-wide generation, so a value
+            # stamped with the old generation can never be served from the cache
+            # afterwards even if it races back into the collection.
             self._cache.flush()
+            self._cache.advance_invalidation_generation()
+            # Retire this socket's invalidation handlers as well: any message the
+            # old socket delivered but nobody reads until after the reconnect will
+            # find itself bound to a stale per-connection generation and be dropped.
+            self._invalidation_generation += 1
         self._conn.disconnect(*args, **kwargs)
 
     def check_health(self):
@@ -1971,9 +1998,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             # We have to trigger invalidation processing in case if
             # it was cached by another connection to avoid
             # queueing invalidations in stale connections.
-            if self._cache.get(self._current_command_cache_key):
-                entry = self._cache.get(self._current_command_cache_key)
+            entry = self._get_current_generation_cache_entry()
 
+            if entry is not None:
                 with self._pool_lock:
                     while entry.connection_ref.can_read():
                         try:
@@ -1985,19 +2012,25 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                         except TimeoutError:
                             break
 
-                # Re-check: if the entry was invalidated during the drain,
-                # fall through to send the command over the network.
+                # Re-check (a third lookup): if the entry was invalidated during
+                # the drain, fall through to send the command over the network.
                 if self._cache.get(self._current_command_cache_key):
                     return
 
             # Set temporary entry value to prevent
-            # race condition from another connection.
+            # race condition from another connection. Stamp it with the cache's
+            # current generation: DefaultCache keeps the stamp when it turns the
+            # entry VALID, and a disconnect between here and the reply advances the
+            # generation so the stale entry is refused instead of stored.
             self._cache.set(
                 CacheEntry(
                     cache_key=self._current_command_cache_key,
                     cache_value=self.DUMMY_CACHE_VALUE,
                     status=CacheEntryStatus.IN_PROGRESS,
                     connection_ref=self._conn,
+                    # ``0`` when the cache does not track generations (mocks, older
+                    # third-party caches), matching CacheEntry's default stamp.
+                    generation=self._get_cache_invalidation_generation() or 0,
                 )
             )
 
@@ -2010,6 +2043,38 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # connection state, not only whether application data can be read.
         return self._conn.can_read(timeout)
 
+    def _get_current_generation_cache_entry(
+        self,
+    ) -> Union["CacheEntry", None]:
+        """
+        Return the cached entry for the in-flight command only if it may be served.
+
+        An entry is servable when it exists and was stamped with the cache's current
+        invalidation generation. Entries learned before a tracked connection
+        disconnected carry an older generation and are dropped rather than served,
+        because the server-side tracking registration that guaranteed their freshness
+        no longer exists. The two ``get`` calls preserve the pre-generation lookup
+        sequence (existence, then fetch) that instrumented/mock caches depend on.
+        """
+        if self._current_command_cache_key is None:
+            return None
+        if not self._cache.get(self._current_command_cache_key):
+            return None
+
+        entry = self._cache.get(self._current_command_cache_key)
+        current_generation = self._get_cache_invalidation_generation()
+
+        # ``None``: the cache does not take part in generation tracking (a mock or a
+        # third-party implementation predating this feature); behave as before.
+        if current_generation is None:
+            return entry
+
+        if entry.generation != current_generation:
+            self._cache.delete_by_cache_keys([self._current_command_cache_key])
+            return None
+
+        return entry
+
     def read_response(
         self,
         disable_decoding=False,
@@ -2021,11 +2086,15 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         with self._cache_lock:
             # Check if command response exists in a cache and it's not in progress.
             if self._current_command_cache_key is not None:
+                cache_entry = self._cache.get(self._current_command_cache_key)
                 if (
-                    self._cache.get(self._current_command_cache_key) is not None
-                    and self._cache.get(self._current_command_cache_key).status
-                    != CacheEntryStatus.IN_PROGRESS
+                    cache_entry is not None
+                    and cache_entry.status != CacheEntryStatus.IN_PROGRESS
+                    and self._is_entry_of_current_generation(cache_entry)
                 ):
+                    # Fetch the value on a second lookup, matching the
+                    # pre-generation read path; deep copy so callers cannot mutate
+                    # the cached object.
                     res = copy.deepcopy(
                         self._cache.get(self._current_command_cache_key).cache_value
                     )
@@ -2061,7 +2130,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
             # Cache only responses that still valid
             # and wasn't invalidated by another connection in meantime.
-            if cache_entry is not None:
+            if cache_entry is not None and self._is_entry_of_current_generation(
+                cache_entry
+            ):
                 cache_entry.status = CacheEntryStatus.VALID
                 cache_entry.cache_value = response
                 self._cache.set(cache_entry)
@@ -2069,6 +2140,33 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             self._current_command_cache_key = None
 
         return response
+
+    def _get_cache_invalidation_generation(self) -> Optional[int]:
+        """
+        Current cache-wide invalidation generation, or ``None`` when unavailable.
+
+        Real caches participating in client-side caching (``DefaultCache`` and its
+        proxies) always report an integer. ``None`` means the cache does not take
+        part in generation tracking - a mock in a unit test, or a third-party
+        :class:`CacheInterface` predating this feature - in which case generations
+        are simply not enforced, preserving the previous behaviour.
+        """
+        generation = getattr(self._cache, "invalidation_generation", None)
+        return generation if isinstance(generation, int) else None
+
+    def _is_entry_of_current_generation(self, entry: "CacheEntry") -> bool:
+        """
+        Whether ``entry`` is still servable given the cache's invalidation state.
+
+        A value learned from an older cache-wide generation (before some tracked
+        connection disconnected) must never be served or upgraded, even if it is
+        still present. Mock/third-party caches without a generation report the
+        interface default and behave as they did before generations existed.
+        """
+        current_generation = self._get_cache_invalidation_generation()
+        if current_generation is None:
+            return True
+        return entry.generation == current_generation
 
     def pack_command(self, *args):
         return self._conn.pack_command(*args)
@@ -2233,7 +2331,19 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
     def _enable_tracking_callback(self, conn: ConnectionInterface) -> None:
         conn.send_command("CLIENT", "TRACKING", "ON")
         conn.read_response()
-        conn._parser.set_invalidation_push_handler(self._on_invalidation_callback)
+        # This socket starts a new invalidation generation. Bump it *after* tracking
+        # is enabled and *before* any reply can be cached, and bind the push handler
+        # to the new value: an invalidation left over from the previous socket and
+        # delivered late reports the old generation and is discarded by the bound
+        # handler, while the current socket's invalidations match and take effect.
+        with self._cache_lock:
+            self._invalidation_generation += 1
+            generation = self._invalidation_generation
+
+        def handle_invalidation(data, _generation=generation):
+            self._on_invalidation_callback(data, _generation)
+
+        conn._parser.set_invalidation_push_handler(handle_invalidation)
 
     def _process_pending_invalidations(self):
         while self.can_read():
@@ -2244,7 +2354,20 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             except TimeoutError:
                 break
 
-    def _on_invalidation_callback(self, data: List[Union[str, Optional[List[bytes]]]]):
+    def _on_invalidation_callback(
+        self,
+        data: List[Union[bytes, str, Optional[List[bytes]]]],
+        generation: int,
+    ):
+        # Drop late invalidations: a message bound to an older generation was
+        # produced by a previous socket, before a disconnect/reconnect. Values
+        # learned afterwards belong to the new generation and must be untouched by
+        # it; the flush performed on disconnect already retired everything older.
+        # Messages delivered by the current socket carry its generation and are
+        # processed normally - invalidations on the live connection still apply.
+        if generation != self._invalidation_generation:
+            return
+
         with self._cache_lock:
             # Flush cache when DB flushed on server-side
             if data[1] is None:

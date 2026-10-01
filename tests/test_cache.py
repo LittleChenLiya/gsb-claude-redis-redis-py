@@ -1597,6 +1597,94 @@ class TestUnitDefaultCache:
         assert cache.flush() == 3
         assert len(cache.collection) == 0
 
+    def test_invalidation_generation_starts_at_zero(self, mock_connection):
+        cache = DefaultCache(CacheConfig(max_size=5))
+        assert cache.invalidation_generation == 0
+
+    def test_set_stamps_entry_with_current_generation(self, mock_connection):
+        cache = DefaultCache(CacheConfig(max_size=5))
+        cache_key = CacheKey(
+            command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
+        )
+        cache.set(
+            CacheEntry(
+                cache_key=cache_key,
+                cache_value=b"bar",
+                status=CacheEntryStatus.VALID,
+                connection_ref=mock_connection,
+            )
+        )
+        assert cache.get(cache_key).generation == 0
+
+        cache.advance_invalidation_generation()
+        cache.set(
+            CacheEntry(
+                cache_key=cache_key,
+                cache_value=b"baz",
+                status=CacheEntryStatus.VALID,
+                connection_ref=mock_connection,
+            )
+        )
+        assert cache.invalidation_generation == 1
+        assert cache.get(cache_key).generation == 1
+        assert cache.get(cache_key).cache_value == b"baz"
+
+    def test_advance_generation_clears_and_returns_new_generation(
+        self, mock_connection
+    ):
+        cache = DefaultCache(CacheConfig(max_size=5))
+        cache_key = CacheKey(
+            command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
+        )
+        cache.set(
+            CacheEntry(
+                cache_key=cache_key,
+                cache_value=b"bar",
+                status=CacheEntryStatus.VALID,
+                connection_ref=mock_connection,
+            )
+        )
+
+        assert cache.advance_invalidation_generation() == 1
+        assert cache.invalidation_generation == 1
+        assert cache.size == 0
+        assert cache.get(cache_key) is None
+
+        # Monotonic: every advance bumps it again.
+        assert cache.advance_invalidation_generation() == 2
+        assert cache.invalidation_generation == 2
+
+    def test_get_refuses_entry_from_older_generation(self, mock_connection):
+        """
+        A cache hit must not cross generations: an entry physically present but
+        stamped with a previous generation is invisible to get().
+        """
+        cache = DefaultCache(CacheConfig(max_size=5))
+        cache_key = CacheKey(
+            command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
+        )
+        old_entry = CacheEntry(
+            cache_key=cache_key,
+            cache_value=b"old",
+            status=CacheEntryStatus.VALID,
+            connection_ref=mock_connection,
+            generation=0,
+        )
+
+        cache.advance_invalidation_generation()  # current generation is now 1
+        cache._cache[cache_key] = old_entry  # forced: stale entry lingers
+
+        assert cache.get(cache_key) is None
+        assert cache_key not in cache.collection  # refused lookup also removes it
+
+    def test_cache_proxy_delegates_generation(self, mock_connection):
+        cache = DefaultCache(CacheConfig(max_size=5))
+        proxy = CacheProxy(cache)
+        assert proxy.invalidation_generation == 0
+        assert proxy.advance_invalidation_generation() == 1
+        assert proxy.invalidation_generation == 1
+        assert cache.invalidation_generation == 1
+
 
 class TestUnitLRUPolicy:
     def test_type(self):

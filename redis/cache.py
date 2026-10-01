@@ -44,15 +44,28 @@ class CacheEntry:
         cache_value: bytes,
         status: CacheEntryStatus,
         connection_ref,
+        generation: int = 0,
     ):
         self.cache_key = cache_key
         self.cache_value = cache_value
         self.status = status
         self.connection_ref = connection_ref
+        # Client-side caching invalidation generation the entry was stored under.
+        # DefaultCache stamps this on every ``set``; it is used to refuse serving
+        # an entry across a generation change (a tracked connection disconnecting
+        # invalidates everything learned before it). See
+        # ``DefaultCache.advance_invalidation_generation``.
+        self.generation = generation
 
     def __hash__(self):
         return hash(
-            (self.cache_key, self.cache_value, self.status, self.connection_ref)
+            (
+                self.cache_key,
+                self.cache_value,
+                self.status,
+                self.connection_ref,
+                self.generation,
+            )
         )
 
     def __eq__(self, other):
@@ -155,6 +168,31 @@ class CacheInterface(ABC):
     def is_cachable(self, key: CacheKey) -> bool:
         pass
 
+    @property
+    def invalidation_generation(self) -> int:
+        """
+        Cache-wide generation of client-side tracking validity.
+
+        Advanced whenever a tracked connection drops: the server-side tracking
+        registration that backed the cached values is gone, so every value learned
+        before that point belongs to an older generation and must never be served as
+        a hit again. Caches not participating in this machinery may keep the default
+        (``0``) and let :meth:`advance_invalidation_generation` be a no-op.
+        """
+        return 0
+
+    def advance_invalidation_generation(self) -> int:
+        """
+        Move the cache to the next invalidation generation.
+
+        Called together with :meth:`flush` by the caching connection when a tracked
+        connection disconnects. Returns the new generation. Implementations that
+        override this are also expected to retire the stored entries, since none of
+        them can be served across a generation boundary. Defaults to a no-op so
+        third-party :class:`CacheInterface` implementations keep working.
+        """
+        return 0
+
 
 class DefaultCache(CacheInterface):
     def __init__(
@@ -165,6 +203,9 @@ class DefaultCache(CacheInterface):
         self._cache_config = cache_config
         self._eviction_policy = self._cache_config.get_eviction_policy().value()
         self._eviction_policy.cache = self
+        # Generation 0 is the pre-connection epoch; the first tracked connection
+        # populates entries under it until the first disconnect advances it.
+        self._invalidation_generation = 0
 
     @property
     def collection(self) -> OrderedDict:
@@ -182,10 +223,24 @@ class DefaultCache(CacheInterface):
     def size(self) -> int:
         return len(self._cache)
 
+    @property
+    def invalidation_generation(self) -> int:
+        return self._invalidation_generation
+
+    def advance_invalidation_generation(self) -> int:
+        # Called under the connection's cache lock, together with ``flush``: after a
+        # tracked connection is gone nothing learned on the old socket may survive.
+        self._cache.clear()
+        self._invalidation_generation += 1
+        return self._invalidation_generation
+
     def set(self, entry: CacheEntry) -> bool:
         if not self.is_cachable(entry.cache_key):
             return False
 
+        # Every stored entry belongs to the generation it was learned in, which lets
+        # ``get`` refuse an entry that races into the collection around a disconnect.
+        entry.generation = self._invalidation_generation
         self._cache[entry.cache_key] = entry
         self._eviction_policy.touch(entry.cache_key)
 
@@ -195,6 +250,13 @@ class DefaultCache(CacheInterface):
         entry = self._cache.get(key, None)
 
         if entry is None:
+            return None
+
+        # A cache hit can never cross invalidation generations: the collection is
+        # cleared on each advance, but an entry inserted concurrently with an
+        # advance (stamped with the old generation) must not be served; drop it.
+        if entry.generation != self._invalidation_generation:
+            self._cache.pop(key, None)
             return None
 
         self._eviction_policy.touch(key)
@@ -301,6 +363,13 @@ class CacheProxy(CacheInterface):
 
     def is_cachable(self, key: CacheKey) -> bool:
         return self._cache.is_cachable(key)
+
+    @property
+    def invalidation_generation(self) -> int:
+        return self._cache.invalidation_generation
+
+    def advance_invalidation_generation(self) -> int:
+        return self._cache.advance_invalidation_generation()
 
 
 class LRUPolicy(EvictionPolicyInterface):

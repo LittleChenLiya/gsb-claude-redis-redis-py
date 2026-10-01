@@ -1952,6 +1952,262 @@ class TestUnitCacheProxyConnection:
         )
 
 
+class _FakeParser:
+    """Minimal stand-in for the real parser: only remembers its push handler."""
+
+    def __init__(self):
+        self.invalidation_push_handler_func = None
+
+    def set_invalidation_push_handler(self, handler):
+        self.invalidation_push_handler_func = handler
+
+
+class _FakeTrackedConnection:
+    """
+    Controllable substitute for the connection wrapped by CacheProxyConnection.
+
+    Simulates a tracked socket through its full life cycle - initial connect,
+    disconnect and reconnect - without a server: each ``connect`` runs the
+    registered connect callbacks (the proxy enables tracking and installs a new
+    invalidation handler, exactly as production does), GETs are scripted through
+    an in-memory "server" value, and invalidation pushes can be delivered through
+    *whichever* handler was installed at any point in time - which is what makes
+    replaying a pre-reconnect (late) message possible.
+    """
+
+    def __init__(self, initial_value=b"v1"):
+        self._connect_callbacks = []
+        self._parser = _FakeParser()
+        self.server_value = initial_value
+        self.get_commands_sent = 0
+        self.connected = False
+        self._awaiting_tracking_reply = False
+        # Attributes CacheProxyConnection reads straight off the wrapped object.
+        self.retry = "mock"
+        self.host = "mock"
+        self.port = "mock"
+        self.db = 0
+        self.credential_provider = UsernamePasswordCredentialProvider()
+        self._event_dispatcher = EventDispatcher()
+
+    def register_connect_callback(self, callback):
+        self._connect_callbacks.append(callback)
+
+    def deregister_connect_callback(self, callback):
+        try:
+            self._connect_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def connect(self):
+        self.connected = True
+        for callback in list(self._connect_callbacks):
+            callback(self)
+
+    def disconnect(self, *args, **kwargs):
+        self.connected = False
+
+    @property
+    def is_connected(self):
+        return self.connected
+
+    def send_command(self, *args, **kwargs):
+        if args and args[0] == "CLIENT":
+            self._awaiting_tracking_reply = True
+        elif args and args[0] == "GET":
+            self.get_commands_sent += 1
+
+    def read_response(self, *args, **kwargs):
+        # The tracking handshake command is answered with OK; ordinary commands
+        # (GET) are answered with the value the "server" currently holds.
+        if self._awaiting_tracking_reply:
+            self._awaiting_tracking_reply = False
+            return b"OK"
+        return self.server_value
+
+    def can_read(self, timeout=0):
+        return False
+
+
+class TestUnitInvalidationGeneration:
+    """
+    Client-side caching "invalidation generation" behaviour.
+
+    Every disconnect of a tracked connection advances the cache-wide generation
+    (and flushes the cache); every (re)connect advances the connection's own
+    generation and binds a fresh invalidation push handler to it. The rules under
+    test:
+
+    * a cached value is a hit only inside the generation it was learned in;
+    * after disconnect/reconnect the old value is gone and the next read goes to
+      the wire and is learned anew;
+    * an invalidation that arrives *late* - produced before the reconnect but
+      replayed by the old handler afterwards - is dropped and must not touch the
+      freshly learned entry;
+    * an invalidation delivered by the live connection still takes effect.
+    """
+
+    KEY = "foo"
+    CACHE_KEY = CacheKey(command="GET", redis_keys=("foo",), redis_args=("GET", "foo"))
+
+    def _build_proxy(self):
+        cache = DefaultCache(CacheConfig(max_size=10))
+        inner = _FakeTrackedConnection()
+        proxy = CacheProxyConnection(inner, cache, threading.RLock())
+        # Before any connect there is no tracking generation yet.
+        assert proxy._invalidation_generation == 0
+        return cache, inner, proxy
+
+    def _get(self, proxy):
+        proxy.send_command("GET", "foo", keys=["foo"])
+        return proxy.read_response()
+
+    def _deliver_invalidation(self, inner, keys):
+        # RESP3 invalidation push shape: ["invalidate", [keys...] | None]
+        inner._parser.invalidation_push_handler_func(["invalidate", keys])
+
+    def test_read_disconnect_reconnect_and_out_of_order_invalidations(self):
+        """
+        End-to-end scenario required for acceptance:
+
+        1. read   -> value learned on the wire, served from cache afterwards;
+        2. disconnect + reconnect -> generation advances, old value is gone;
+        3. read   -> the value is learned on the new socket;
+        4. replay a late invalidation belonging to the *previous* connection ->
+           it must be dropped, the fresh value survives;
+        5. an invalidation from the *current* connection still invalidates.
+        """
+        cache, inner, proxy = self._build_proxy()
+
+        # --- 1. read -----------------------------------------------------
+        inner.connect()  # initial connect: tracking enabled, handler for gen
+        assert proxy._invalidation_generation == 1
+        assert cache.invalidation_generation == 0
+
+        assert self._get(proxy) == b"v1"  # miss: went to the wire
+        sent_after_first_read = inner.get_commands_sent
+        assert sent_after_first_read == 1
+
+        # Served straight from the cache now: no extra GET on the wire, and the
+        # stored entry is stamped with the cache generation it was learned in.
+        assert self._get(proxy) == b"v1"
+        assert inner.get_commands_sent == sent_after_first_read
+        entry = cache.get(self.CACHE_KEY)
+        assert entry is not None
+        assert entry.status == CacheEntryStatus.VALID
+        assert entry.cache_value == b"v1"
+        assert entry.generation == cache.invalidation_generation == 0
+
+        # --- 2. disconnect + reconnect ----------------------------------
+        proxy.disconnect()
+        assert inner.connected is False
+        # The disconnect flushed the cache and advanced the cache generation; the
+        # retired socket's generation was retired as well.
+        assert cache.size == 0
+        assert cache.invalidation_generation == 1
+        assert proxy._invalidation_generation == 2
+        assert cache.get(self.CACHE_KEY) is None
+
+        # Capture the handler bound to the *old* socket before reconnecting: it is
+        # the channel through which a late pre-reconnect message would arrive.
+        old_handler = inner._parser.invalidation_push_handler_func
+        assert old_handler is not None
+
+        inner.server_value = b"v2"
+        inner.connect()  # reconnect: new tracking registration, new generation
+        assert proxy._invalidation_generation == 3
+        assert inner._parser.invalidation_push_handler_func is not old_handler
+
+        # --- 3. read on the new connection ------------------------------
+        assert self._get(proxy) == b"v2"  # miss again: old value was unusable
+        assert inner.get_commands_sent == sent_after_first_read + 1
+        entry = cache.get(self.CACHE_KEY)
+        assert entry.cache_value == b"v2"
+        assert entry.generation == cache.invalidation_generation == 1
+
+        # And it is now a cache hit in the new generation.
+        assert self._get(proxy) == b"v2"
+        assert inner.get_commands_sent == sent_after_first_read + 1
+
+        # --- 4. out-of-order: a late invalidation from the old socket ---
+        old_handler(["invalidate", [b"foo"]])
+        # Dropped: the fresh entry is untouched and still served from the cache.
+        assert cache.get(self.CACHE_KEY).cache_value == b"v2"
+        assert self._get(proxy) == b"v2"
+        assert inner.get_commands_sent == sent_after_first_read + 1
+
+        # A late *flush* invalidation (data[1] is None) is dropped too.
+        old_handler(["invalidate", None])
+        assert cache.size == 1
+
+        # --- 5. invalidation on the current connection still applies ----
+        self._deliver_invalidation(inner, [b"foo"])
+        assert cache.get(self.CACHE_KEY) is None
+        assert self._get(proxy) == b"v2"  # re-learned from the wire
+        assert inner.get_commands_sent == sent_after_first_read + 2
+
+    def test_cache_hit_cannot_cross_generations(self):
+        """
+        Even if an old-generation entry were still physically present in the
+        collection (forced here), neither the hit path nor the reply upgrade path
+        may use it: the next read must go to the wire.
+        """
+        cache, inner, proxy = self._build_proxy()
+        inner.connect()
+        assert self._get(proxy) == b"v1"
+        old_entry = cache.get(self.CACHE_KEY)
+        assert old_entry.generation == 0
+
+        # Simulate a disconnect advancing the generation while the entry lingers
+        # (cache flush already removes it in production; this proves the entry
+        # stamp check independently).
+        proxy.disconnect()
+        assert cache.invalidation_generation == 1
+        cache._cache[self.CACHE_KEY] = old_entry  # forcibly resurrect the entry
+
+        inner.server_value = b"v2"
+        inner.connect()
+        # The stale entry is refused rather than served...
+        assert self._get(proxy) == b"v2"
+        assert inner.get_commands_sent == 2
+        # ...and it was replaced during the lookup and re-learned under the
+        # current generation.
+        new_entry = cache.get(self.CACHE_KEY)
+        assert new_entry.cache_value == b"v2"
+        assert new_entry.generation == 1
+
+    def test_current_generation_invalidations_still_take_effect_without_reconnect(self):
+        """Boundary: without any disconnect, a normal invalidation keeps working."""
+        cache, inner, proxy = self._build_proxy()
+        inner.connect()
+        assert self._get(proxy) == b"v1"
+        assert cache.size == 1
+
+        self._deliver_invalidation(inner, [b"foo"])
+        assert cache.size == 0
+        # The miss re-learns the value (the "server" still holds v1).
+        assert self._get(proxy) == b"v1"
+        assert inner.get_commands_sent == 2
+
+    def test_late_invalidation_for_unrelated_fresh_key_is_ignored(self):
+        """A stale message naming a different key must not run any cache mutation."""
+        cache, inner, proxy = self._build_proxy()
+        inner.connect()
+        assert self._get(proxy) == b"v1"
+        old_handler = inner._parser.invalidation_push_handler_func
+
+        proxy.disconnect()
+        inner.connect()
+        assert self._get(proxy) == b"v1"
+
+        with mock.patch.object(
+            cache, "delete_by_redis_keys", wraps=cache.delete_by_redis_keys
+        ) as wrapped:
+            old_handler(["invalidate", [b"other"]])
+            wrapped.assert_not_called()
+        assert cache.get(self.CACHE_KEY).cache_value == b"v1"
+
+
 class TestConnectionPoolGetConnectionCount:
     """Tests for ConnectionPool.get_connection_count() method."""
 
