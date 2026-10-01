@@ -151,6 +151,45 @@ like this, which is much easier to read:
 Be sure to call pipe.multi() in the callable passed to Redis.transaction
 prior to any write commands.
 
+Locating which pipeline command failed
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default ``execute()`` raises on the first command error. Pass
+``raise_on_error=False`` to keep the exception instances inline in the
+response list instead. When you also need to know *which* queued commands
+failed, pass ``return_failure_indexes=True``: ``execute()`` then returns a
+``(responses, failed_indexes)`` tuple where ``failed_indexes`` lists the
+zero-based positions of the responses that hold an exception.
+
+.. code:: python
+
+   >>> with r.pipeline() as pipe:
+   ...     pipe.set("a", 1).get("a").lpush("a", 3).get("a")
+   ...     responses, failed_indexes = pipe.execute(
+   ...         raise_on_error=False, return_failure_indexes=True
+   ...     )
+   ...
+   >>> responses
+   [True, b'1', ResponseError("WRONGTYPE ..."), None]
+   >>> failed_indexes
+   [2]
+
+In transactional mode the failing command still participates in the usual
+MULTI/EXEC semantics: Redis aborts or rolls the transaction back server
+side, the report only tells you which command caused it. If the
+connection drops mid-batch, ``execute()`` raises as before; the raised
+exception then carries ``pipeline_command_index`` (and
+``pipeline_command_name``) identifying the command whose reply was being
+read when the stream ended.
+
+``return_failure_indexes`` only works together with
+``raise_on_error=False`` (a ``ValueError`` is raised otherwise), and the
+report intentionally contains numeric indexes only. The default mode is
+unchanged, except that the raised exception also exposes
+``pipeline_command_index`` / ``pipeline_command_name``. In neither case
+are command arguments - which may hold secrets such as tokens or
+passwords - included in the structured failure report.
+
 Pipelines in clusters
 ~~~~~~~~~~~~~~~~~~~~~
 

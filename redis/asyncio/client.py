@@ -2073,7 +2073,11 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         await _himport_exec.prepare_pipeline(self, conn, [args for args, _ in commands])
 
     async def _execute_transaction(  # noqa: C901
-        self, connection: Connection, commands: CommandStackT, raise_on_error
+        self,
+        connection: Connection,
+        commands: CommandStackT,
+        raise_on_error,
+        return_failure_indexes: bool = False,
     ):
         # Ensure fieldsets referenced by buffered HIMPORT SETs are prepared on this
         # connection before the MULTI/EXEC block (session state, not transactional).
@@ -2112,7 +2116,15 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             response = await self.parse_response(connection, "_")
         except ExecAbortError as err:
             if errors:
-                raise errors[0][1] from err
+                # the queued command rejected by the server aborts the whole
+                # transaction; tag the offending command for failure reports
+                # in case the caller inspects the raised exception
+                index, first_error = errors[0]
+                if not hasattr(first_error, "pipeline_command_index"):
+                    self._annotate_failure_index(
+                        first_error, index, commands[index][0][0]
+                    )
+                raise first_error from err
             raise
 
         # EXEC clears any watched keys
@@ -2131,6 +2143,12 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             raise ResponseError(
                 "Wrong number of response items from pipeline execution"
             ) from None
+
+        # errors returned by EXEC arrive without per-command annotation, so
+        # tag them now with their zero-based command position and name
+        for i, r in enumerate(response):
+            if isinstance(r, Exception) and not hasattr(r, "pipeline_command_index"):
+                self._annotate_failure_index(r, i, commands[i][0][0])
 
         # find any errors in the response and raise if necessary
         if raise_on_error:
@@ -2151,10 +2169,16 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                     if inspect.isawaitable(r):
                         r = await r
             data.append(r)
+        if return_failure_indexes:
+            return data, self._failure_indexes(data)
         return data
 
     async def _execute_pipeline(
-        self, connection: Connection, commands: CommandStackT, raise_on_error: bool
+        self,
+        connection: Connection,
+        commands: CommandStackT,
+        raise_on_error: bool,
+        return_failure_indexes: bool = False,
     ):
         # Fold any first-use HIMPORT PREPAREs for referenced fieldsets into the same
         # packed write as the queued commands, so a pipeline that lands on a fresh or
@@ -2178,13 +2202,23 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
 
         response = []
-        for args, options in commands:
+        for i, (args, options) in enumerate(commands):
             try:
                 response.append(
                     await self.parse_response(connection, args[0], **options)
                 )
             except ResponseError as e:
+                self._annotate_failure_index(e, i, args[0])
                 response.append(e)
+            except Exception as e:
+                # A connection-level failure (the server dropped the stream,
+                # a timeout, ...) while reading this command's reply: the
+                # remaining replies never arrive, so the batch cannot be
+                # reported. Record which command was being read before the
+                # error propagates (the connection is disconnected by the
+                # parser/connection layer on its way out).
+                self._annotate_failure_index(e, i, args[0])
+                raise
 
         # A PREPARE failure (rare: an invalid fieldset definition) is a hard error,
         # raised regardless of raise_on_error as it was before folding -- only now
@@ -2193,6 +2227,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             raise prep_error
         if raise_on_error:
             self.raise_first_error(commands, response)
+        if return_failure_indexes:
+            return response, self._failure_indexes(response)
         return response
 
     def raise_first_error(self, commands: CommandStackT, response: Iterable[Any]):
@@ -2201,15 +2237,46 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 self.annotate_exception(r, i + 1, commands[i][0])
                 raise r
 
+    @staticmethod
+    def _annotate_failure_index(
+        exception: Exception,
+        index: int,
+        command_name: Any = None,
+    ) -> Exception:
+        """
+        Record which buffered command (zero-based position) a failure belongs
+        to on the exception itself.
+
+        Only the numeric index and the command *name* are exposed; command
+        arguments never reach these attributes so that secrets staged in a
+        pipeline (tokens, passwords, payloads) cannot leak through an error
+        report.
+        """
+        exception.pipeline_command_index = index  # type: ignore[attr-defined]
+        if command_name is not None:
+            exception.pipeline_command_name = safe_str(command_name)  # type: ignore[attr-defined]
+        return exception
+
+    @staticmethod
+    def _failure_indexes(response: Iterable[Any]) -> List[int]:
+        """Zero-based positions of the responses that hold an exception."""
+        return [i for i, r in enumerate(response) if isinstance(r, Exception)]
+
     def annotate_exception(
         self, exception: Exception, number: int, command: Iterable[object]
     ) -> None:
+        command = list(command)
         cmd = " ".join(map(safe_str, command))
         msg = (
             f"Command # {number} ({truncate_text(cmd)}) "
             f"of pipeline caused error: {exception.args}"
         )
         exception.args = (msg,) + exception.args[1:]
+        # ``number`` is 1-based; record the zero-based index and the command
+        # name without any of the (potentially sensitive) arguments.
+        self._annotate_failure_index(
+            exception, number - 1, command[0] if command else None
+        )
 
     async def parse_response(
         self, connection: Connection, command_name: Union[str, bytes], **options
@@ -2274,11 +2341,38 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 f"A {type(error).__name__} occurred while watching one or more keys"
             )
 
-    async def execute(self, raise_on_error: bool = True) -> List[Any]:
-        """Execute all the commands in the current pipeline"""
+    async def execute(
+        self,
+        raise_on_error: bool = True,
+        return_failure_indexes: bool = False,
+    ) -> Union[List[Any], Tuple[List[Any], List[int]]]:
+        """
+        Execute all the commands in the current pipeline.
+
+        :param raise_on_error: When ``True`` (the default), the first
+            ``ResponseError`` produced by a queued command is raised,
+            preserving the historical behavior. When ``False``, exceptions
+            are returned inline as elements of the response list instead.
+        :param return_failure_indexes: When ``True``, return a
+            ``(responses, failed_indexes)`` tuple where ``failed_indexes`` is
+            the list of zero-based positions of the queued commands whose
+            response is an exception. This is only meaningful together with
+            ``raise_on_error=False`` (when errors are kept in the response
+            list) and raises ``ValueError`` otherwise. The report contains
+            numeric indexes only -- command arguments, which may hold
+            secrets, are never included. Independently of this option, an
+            exception raised in the default ``raise_on_error=True`` mode
+            carries ``pipeline_command_index`` and ``pipeline_command_name``
+            attributes when the failing command is known.
+        """
         stack = self.command_stack
         if not stack and not self.watching:
-            return []
+            return ([], []) if return_failure_indexes else []
+        if return_failure_indexes and raise_on_error:
+            raise ValueError(
+                "return_failure_indexes=True requires raise_on_error=False, "
+                "otherwise the first failure is raised instead of reported"
+            )
         if self.scripts:
             await self.load_scripts()
         if self.is_transaction or self.explicit_transaction:
@@ -2312,7 +2406,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
         try:
             response = await conn.retry.call_with_retry(
-                lambda: execute(conn, stack, raise_on_error),
+                lambda: execute(conn, stack, raise_on_error, return_failure_indexes),
                 failure_callback,
                 with_failure_count=True,
             )
