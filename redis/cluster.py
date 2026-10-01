@@ -99,6 +99,7 @@ from redis.observability.recorder import (
     record_error_count,
     record_operation_duration,
 )
+from redis.redirection import RedirectionTracker
 from redis.retry import Retry
 from redis.typing import (
     ChannelT,
@@ -1770,11 +1771,24 @@ class RedisCluster(
             ClusterNode
             list<ClusterNode>
             dict<Any, ClusterNode>
+
+        Key argument :redirect_tracker: can be passed with a
+        redis.redirection.RedirectionTracker instance to record every
+        MOVED/ASK redirection the request follows (slot id and node names).
+        It never stores command arguments or authentication data.
         """
         target_nodes_specified = False
         is_default_node = False
         target_nodes = None
         passed_targets = kwargs.pop("target_nodes", None)
+        redirect_tracker = kwargs.pop("redirect_tracker", None)
+        if redirect_tracker is not None and not isinstance(
+            redirect_tracker, RedirectionTracker
+        ):
+            raise TypeError(
+                "redirect_tracker must be a redis.redirection.RedirectionTracker "
+                f"instance, got {type(redirect_tracker).__name__}"
+            )
         if (
             passed_targets is not None
             and not self._is_nodes_flag(passed_targets)
@@ -1826,7 +1840,15 @@ class RedisCluster(
                     ):
                         is_default_node = True
                 for node in target_nodes:
-                    res[node.name] = self._execute_command(node, *args, **kwargs)
+                    if redirect_tracker is not None:
+                        res[node.name] = self._execute_command(
+                            node,
+                            *args,
+                            redirect_tracker=redirect_tracker,
+                            **kwargs,
+                        )
+                    else:
+                        res[node.name] = self._execute_command(node, *args, **kwargs)
 
                     if command_policies.response_policy == ResponsePolicy.ONE_SUCCEEDED:
                         break
@@ -1922,7 +1944,7 @@ class RedisCluster(
             redis_node, connection, key, fieldset_name, values, asking=asking
         )
 
-    def _execute_command(self, target_node, *args, **kwargs):
+    def _execute_command(self, target_node, *args, redirect_tracker=None, **kwargs):
         """
         Send a command to a node in the cluster
         """
@@ -2014,6 +2036,8 @@ class RedisCluster(
                     duration_seconds=time.monotonic() - start_time,
                     connection=connection,
                 )
+                if redirect_tracker is not None:
+                    redirect_tracker.set_final_node(target_node.name)
                 return response
             except AuthenticationError as e:
                 e.connection = connection if connection is not None else target_node
@@ -2123,6 +2147,12 @@ class RedisCluster(
                 else:
                     self.nodes_manager.move_slot(e)
                 moved = True
+                if redirect_tracker is not None:
+                    redirect_tracker.record_moved(
+                        slot_id=e.slot_id,
+                        from_node=target_node.name,
+                        to_node=get_node_name(host=e.host, port=e.port),
+                    )
                 self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
@@ -2176,6 +2206,12 @@ class RedisCluster(
                     )
                 redirect_addr = get_node_name(host=e.host, port=e.port)
                 asking = True
+                if redirect_tracker is not None:
+                    redirect_tracker.record_ask(
+                        slot_id=e.slot_id,
+                        from_node=target_node.name,
+                        to_node=redirect_addr,
+                    )
 
                 self._record_command_metric(
                     command_name=command,

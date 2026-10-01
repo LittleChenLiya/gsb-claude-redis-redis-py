@@ -132,6 +132,7 @@ from redis.exceptions import (
 )
 from redis.himport import HImportRegistry, parse_himport_set_args
 from redis.maint_notifications import MaintNotificationsConfig
+from redis.redirection import RedirectionTracker
 from redis.typing import (
     AnyKeyT,
     ChannelT,
@@ -1351,6 +1352,10 @@ class RedisCluster(
 
             - target_nodes: :attr:`NODE_FLAGS` or :class:`~.ClusterNode`
               or List[:class:`~.ClusterNode`] or Dict[Any, :class:`~.ClusterNode`]
+            - redirect_tracker: optional
+              :class:`~redis.redirection.RedirectionTracker` that records every
+              MOVED/ASK redirection this request follows (slot id and node
+              names). It never stores command arguments or authentication data.
             - Rest of the kwargs are passed to the Redis connection
 
         :raises RedisClusterException: if target_nodes is not provided & the command
@@ -1361,6 +1366,14 @@ class RedisCluster(
         retry_attempts = self.retry.get_retries()
 
         passed_targets = kwargs.pop("target_nodes", None)
+        redirect_tracker = kwargs.pop("redirect_tracker", None)
+        if redirect_tracker is not None and not isinstance(
+            redirect_tracker, RedirectionTracker
+        ):
+            raise TypeError(
+                "redirect_tracker must be a redis.redirection.RedirectionTracker "
+                f"instance, got {type(redirect_tracker).__name__}"
+            )
         if (
             passed_targets is not None
             and not self._is_node_flag(passed_targets)
@@ -1409,7 +1422,17 @@ class RedisCluster(
 
                 if len(target_nodes) == 1:
                     # Return the processed result
-                    ret = await self._execute_command(target_nodes[0], *args, **kwargs)
+                    if redirect_tracker is not None:
+                        ret = await self._execute_command(
+                            target_nodes[0],
+                            *args,
+                            redirect_tracker=redirect_tracker,
+                            **kwargs,
+                        )
+                    else:
+                        ret = await self._execute_command(
+                            target_nodes[0], *args, **kwargs
+                        )
                     if command in self.result_callbacks:
                         ret = self.result_callbacks[command](
                             command, {target_nodes[0].name: ret}, **kwargs
@@ -1422,7 +1445,12 @@ class RedisCluster(
                     values = await asyncio.gather(
                         *(
                             asyncio.create_task(
-                                self._execute_command(node, *args, **kwargs)
+                                self._execute_command(
+                                    node,
+                                    *args,
+                                    redirect_tracker=redirect_tracker,
+                                    **kwargs,
+                                )
                             )
                             for node in target_nodes
                         )
@@ -1472,7 +1500,11 @@ class RedisCluster(
                     raise e
 
     async def _execute_command(
-        self, target_node: "ClusterNode", *args: Union[KeyT, EncodableT], **kwargs: Any
+        self,
+        target_node: "ClusterNode",
+        *args: Union[KeyT, EncodableT],
+        redirect_tracker: Optional[RedirectionTracker] = None,
+        **kwargs: Any,
     ) -> Any:
         asking = moved = False
         redirect_addr = None
@@ -1518,6 +1550,8 @@ class RedisCluster(
                     duration_seconds=time.monotonic() - start_time,
                     connection=target_node,
                 )
+                if redirect_tracker is not None:
+                    redirect_tracker.set_final_node(target_node.name)
                 return response
             except BusyLoadingError as e:
                 e.connection = target_node
@@ -1608,6 +1642,12 @@ class RedisCluster(
                 else:
                     await self.nodes_manager.move_slot(e)
                 moved = True
+                if redirect_tracker is not None:
+                    redirect_tracker.record_moved(
+                        slot_id=e.slot_id,
+                        from_node=target_node.name,
+                        to_node=get_node_name(host=e.host, port=e.port),
+                    )
                 await self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
@@ -1621,6 +1661,12 @@ class RedisCluster(
             except AskError as e:
                 redirect_addr = get_node_name(host=e.host, port=e.port)
                 asking = True
+                if redirect_tracker is not None:
+                    redirect_tracker.record_ask(
+                        slot_id=e.slot_id,
+                        from_node=target_node.name,
+                        to_node=redirect_addr,
+                    )
                 await self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
