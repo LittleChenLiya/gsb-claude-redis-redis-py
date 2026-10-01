@@ -1849,6 +1849,120 @@ class PubSubWorkerThread(threading.Thread):
         self._running.clear()
 
 
+class PipelineFailure:
+    """
+    Partial-failure record for a single command of a pipeline.
+
+    A ``PipelineFailure`` locates a command that failed without leaking the
+    command's arguments. Only the command's position in the pipeline and its
+    name are reported; arguments (which may contain secrets such as passwords
+    or tokens passed to ``CONFIG SET``, ``ACL SETUSER`` and similar commands)
+    are intentionally omitted.
+
+    Attributes:
+        index: zero-based position of the command in the pipeline stack.
+        command: name of the failed command only, e.g. ``"SET"``.
+        error: the server-provided :class:`~redis.exceptions.ResponseError`.
+    """
+
+    __slots__ = ("index", "command", "error")
+
+    def __init__(self, index: int, command: str, error: ResponseError):
+        self.index = index
+        self.command = command
+        self.error = error
+
+    @property
+    def message(self) -> str:
+        """The server-provided error message, without command arguments."""
+        return str(self.error)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(index={self.index}, "
+            f"command={self.command!r}, error={self.error!r})"
+        )
+
+
+class PipelineResult:
+    """
+    Result of a pipeline execution with partial-failure localization.
+
+    Returned by :meth:`Pipeline.execute` when ``report_failures=True``.
+
+    ``responses`` holds one entry per queued command: either the parsed
+    result or the unannotated :class:`~redis.exceptions.ResponseError` for
+    commands that failed. ``failures`` lists the same failures as
+    :class:`PipelineFailure` records, which carry the failing command's
+    index and name but never its arguments.
+
+    The object also supports the sequence protocol (``len(result)``,
+    ``result[i]``, iteration) over :attr:`responses` for convenience.
+    """
+
+    __slots__ = ("_responses", "_failures")
+
+    def __init__(self, responses: List[Any], failures: List[PipelineFailure]):
+        self._responses = responses
+        self._failures = failures
+
+    @property
+    def responses(self) -> List[Any]:
+        """Per-command results; failed entries are ResponseError instances."""
+        return self._responses
+
+    @property
+    def failures(self) -> List[PipelineFailure]:
+        """Records for every command that failed, in pipeline order."""
+        return self._failures
+
+    @property
+    def failed_indices(self) -> List[int]:
+        """Zero-based indices of the commands that failed."""
+        return [failure.index for failure in self._failures]
+
+    def failed(self, index: int) -> bool:
+        """Whether the command at ``index`` failed."""
+        return index in self.failed_indices
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether every command in the pipeline executed successfully."""
+        return not self._failures
+
+    def __len__(self) -> int:
+        return len(self._responses)
+
+    def __getitem__(self, index):
+        return self._responses[index]
+
+    def __iter__(self):
+        return iter(self._responses)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(responses={self._responses!r}, "
+            f"failures={self._failures!r})"
+        )
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, PipelineResult):
+            return self._responses == other._responses and [
+                (failure.index, failure.command, failure.message)
+                for failure in self._failures
+            ] == [
+                (failure.index, failure.command, failure.message)
+                for failure in other._failures
+            ]
+        return NotImplemented
+
+    def __ne__(self, other: Any) -> bool:
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+
 class Pipeline(Redis):
     """
     Pipelines provide a way to transmit multiple commands to the Redis server
@@ -2069,8 +2183,12 @@ class Pipeline(Redis):
         _himport_exec.prepare_pipeline(self, conn, [args for args, _ in commands])
 
     def _execute_transaction(
-        self, connection: Connection, commands, raise_on_error
-    ) -> List:
+        self,
+        connection: Connection,
+        commands,
+        raise_on_error,
+        report_failures: bool = False,
+    ) -> Union[List, "PipelineResult"]:
         # Ensure fieldsets referenced by buffered HIMPORT SETs are prepared on this
         # connection before the MULTI/EXEC block (session state, not transactional).
         self._himport_prepare_pipeline(connection, commands)
@@ -2080,6 +2198,8 @@ class Pipeline(Redis):
         )
         connection.send_packed_command(all_cmds)
         errors = []
+        failures: List[PipelineFailure] = []
+        multi_error = None
 
         # parse off the response for MULTI
         # NOTE: we need to handle ResponseErrors here and continue
@@ -2088,6 +2208,7 @@ class Pipeline(Redis):
         try:
             self.parse_response(connection, "_")
         except ResponseError as e:
+            multi_error = e
             errors.append((0, e))
 
         # and all the other commands
@@ -2098,13 +2219,27 @@ class Pipeline(Redis):
                 try:
                     self.parse_response(connection, "_")
                 except ResponseError as e:
-                    self.annotate_exception(e, i + 1, command[0])
+                    if not report_failures:
+                        self.annotate_exception(e, i + 1, command[0])
                     errors.append((i, e))
 
         # parse the EXEC.
         try:
             response = self.parse_response(connection, "_")
         except ExecAbortError:
+            if report_failures:
+                # The server refused to execute the transaction, so none of
+                # the commands ran. Report the queue-time failures and leave
+                # the rest of the entries empty instead of raising.
+                data = [None] * len(commands)
+                for i, e in errors:
+                    if 0 <= i < len(data):
+                        data[i] = e
+                        if isinstance(e, ResponseError):
+                            failures.append(
+                                PipelineFailure(i, safe_str(commands[i][0][0]), e)
+                            )
+                return PipelineResult(data, failures)
             if errors:
                 raise errors[0][1]
             raise
@@ -2114,6 +2249,11 @@ class Pipeline(Redis):
 
         if response is None:
             raise WatchError("Watched variable changed.")
+
+        if report_failures and multi_error is not None:
+            # The transaction never started; partial command failures cannot
+            # be localized faithfully, so surface the protocol-level error.
+            raise multi_error
 
         # put any parse errors into the response
         for i, e in errors:
@@ -2126,7 +2266,7 @@ class Pipeline(Redis):
             )
 
         # find any errors in the response and raise if necessary
-        if raise_on_error:
+        if raise_on_error and not report_failures:
             self.raise_first_error(commands, response)
 
         # We have to run response callbacks manually
@@ -2141,9 +2281,19 @@ class Pipeline(Redis):
                     r = self.response_callbacks[command_name](r, **options)
             data.append(r)
 
+        if report_failures:
+            # Localize every failure from the assembled response. This catches
+            # both queue-time errors (inserted above) and errors the server
+            # reported inside the EXEC reply.
+            for i, r in enumerate(response):
+                if isinstance(r, ResponseError):
+                    failures.append(PipelineFailure(i, safe_str(commands[i][0][0]), r))
+            return PipelineResult(data, failures)
         return data
 
-    def _execute_pipeline(self, connection, commands, raise_on_error):
+    def _execute_pipeline(
+        self, connection, commands, raise_on_error, report_failures: bool = False
+    ) -> Union[List, "PipelineResult"]:
         # Fold any first-use HIMPORT PREPAREs for referenced fieldsets into the same
         # packed write as the queued commands, so a pipeline that lands on a fresh or
         # reconnected connection stays a single round trip (the batched write bypasses
@@ -2164,10 +2314,15 @@ class Pipeline(Redis):
         prep_error = _himport_exec.drain_pipeline_prepares(self, connection, fieldsets)
 
         responses = []
-        for args, options in commands:
+        failures: List[PipelineFailure] = []
+        for i, (args, options) in enumerate(commands):
             try:
                 responses.append(self.parse_response(connection, args[0], **options))
             except ResponseError as e:
+                if report_failures:
+                    # Do not annotate with command arguments: the report must
+                    # never leak secrets passed as command arguments.
+                    failures.append(PipelineFailure(i, safe_str(args[0]), e))
                 responses.append(e)
 
         # A PREPARE failure (rare: an invalid fieldset definition) is a hard error,
@@ -2175,9 +2330,11 @@ class Pipeline(Redis):
         # every reply has already been drained.
         if prep_error is not None:
             raise prep_error
-        if raise_on_error:
+        if raise_on_error and not report_failures:
             self.raise_first_error(commands, responses)
 
+        if report_failures:
+            return PipelineResult(responses, failures)
         return responses
 
     def raise_first_error(self, commands, response):
@@ -2251,8 +2408,22 @@ class Pipeline(Redis):
                 f"A {type(error).__name__} occurred while watching one or more keys"
             )
 
-    def execute(self, raise_on_error: bool = True) -> List[Any]:
-        """Execute all the commands in the current pipeline"""
+    def execute(
+        self, raise_on_error: bool = True, report_failures: bool = False
+    ) -> Union[List[Any], "PipelineResult"]:
+        """Execute all the commands in the current pipeline.
+
+        If ``report_failures`` is True, returns a :class:`PipelineResult`
+        instead of a plain list. Partial command failures are then reported
+        in :attr:`PipelineResult.failures` (each carrying the failing
+        command's zero-based index and its name, but never its arguments)
+        rather than raised; connection-level errors still propagate.
+
+        When ``report_failures`` is False (the default), behavior is
+        unchanged: the first command error is raised when
+        ``raise_on_error`` is True and inlined into the response list
+        otherwise.
+        """
         stack = self.command_stack
         if not stack and not self.watching:
             return []
@@ -2287,7 +2458,7 @@ class Pipeline(Redis):
 
         try:
             response = conn.retry.call_with_retry(
-                lambda: execute(conn, stack, raise_on_error),
+                lambda: execute(conn, stack, raise_on_error, report_failures),
                 failure_callback,
                 with_failure_count=True,
             )
