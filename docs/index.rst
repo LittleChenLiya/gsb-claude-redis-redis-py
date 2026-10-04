@@ -75,6 +75,7 @@ Module Documentation
    opentelemetry
    resp3_features
    unified_responses
+   pubsub_local_buffer
    advanced_features
    examples
 

@@ -47,6 +47,11 @@ from redis.exceptions import (
     TimeoutError,
     WatchError,
 )
+from redis.pubsub_buffer import (
+    BoundedPubSubBuffer,
+    ConsumerClosedError,
+    PubSubLease,
+)
 from redis.sentinel import (
     Sentinel,
     SentinelConnectionPool,
@@ -73,6 +78,7 @@ __all__ = [
     "AuthenticationError",
     "AuthenticationWrongNumberOfArgsError",
     "BlockingConnectionPool",
+    "BoundedPubSubBuffer",
     "BusyLoadingError",
     "ChannelType",
     "ChildDeadlockedError",
@@ -80,6 +86,7 @@ __all__ = [
     "Connection",
     "ConnectionError",
     "ConnectionPool",
+    "ConsumerClosedError",
     "CredentialProvider",
     "CrossSlotTransactionError",
     "DataError",
@@ -103,6 +110,7 @@ __all__ = [
     "MaxConnectionsError",
     "OutOfMemoryError",
     "PubSubError",
+    "PubSubLease",
     "ReadOnlyError",
     "Redis",
     "RedisCluster",
