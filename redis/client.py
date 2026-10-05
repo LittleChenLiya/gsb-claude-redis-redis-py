@@ -29,6 +29,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_READ_SIZE,
     DEFAULT_SOCKET_TIMEOUT,
 )
+from redis._inspect import PipelineInspection, inspect_command_stack
 from redis._parsers.encoders import Encoder
 from redis._parsers.helpers import bool_ok, get_response_callbacks
 from redis.backoff import ExponentialWithJitterBackoff
@@ -2057,6 +2058,26 @@ class Pipeline(Redis):
         """
         self.command_stack.append((args, options))
         return self
+
+    def inspect_commands(self) -> PipelineInspection:
+        """
+        Build an offline manifest of the commands staged so far.
+
+        The manifest keeps each command's original sequence number, the
+        positions of its key arguments (following the registered command
+        specs; commands the registry does not know are reported with
+        ``key_status == "unknown"``), and whether it will run inside the
+        MULTI/EXEC block. Sensitive arguments such as AUTH passwords are
+        redacted - only their category is reported.
+
+        This is a purely local operation: it does not send, pack, or encode
+        anything, does not acquire a connection, and leaves ``command_stack``
+        untouched, so a later ``execute()`` is unaffected.
+        """
+        return inspect_command_stack(
+            self.command_stack,
+            transaction=bool(self.transaction or self.explicit_transaction),
+        )
 
     def _himport_prepare_pipeline(self, conn, commands):
         """Delegate to the shared sync HIMPORT executor."""
