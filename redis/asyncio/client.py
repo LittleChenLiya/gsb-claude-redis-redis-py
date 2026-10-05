@@ -68,6 +68,7 @@ from redis.commands import (
     list_or_args,
 )
 from redis.commands.helpers import parse_pubsub_subscriptions, pubsub_subscription_args
+from redis.commands.specs import InspectedCommand, inspect_command
 from redis.credentials import CredentialProvider
 from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
@@ -2061,6 +2062,58 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         """
         self.command_stack.append((args, options))
         return self
+
+    def inspect(self) -> List[InspectedCommand]:
+        """
+        Return an explicit offline command list for the current pipeline.
+
+        This is a pure, offline inspection: it reads the staged
+        :attr:`command_stack` and the registered command specs only. It never
+        contacts the server, never encodes a command, and never mutates the
+        pipeline state.
+
+        Each entry preserves the original index of the staged command, its
+        registered key positions, and whether it executes inside the MULTI/EXEC
+        transaction block. The transaction boundaries themselves are reported
+        as synthesized ``MULTI`` / ``EXEC`` entries (with ``index=None``), so
+        the transaction order is visible without executing anything.
+
+        Key positions follow the registered command specs; commands that are
+        not registered are reported with ``key_positions=None`` (unknown)
+        rather than guessing that every string argument is a key. Sensitive
+        arguments (e.g. passwords) are redacted to their category.
+
+        Returns:
+            A list of :class:`InspectedCommand` entries in execution order.
+        """
+
+        in_transaction = self.is_transaction or self.explicit_transaction
+        report: List[InspectedCommand] = []
+
+        if in_transaction:
+            report.append(
+                inspect_command(
+                    index=None,
+                    args=("MULTI",),
+                    in_transaction=True,
+                    is_boundary=True,
+                )
+            )
+
+        for index, (args, _options) in enumerate(self.command_stack):
+            report.append(inspect_command(index, args, in_transaction))
+
+        if in_transaction:
+            report.append(
+                inspect_command(
+                    index=None,
+                    args=("EXEC",),
+                    in_transaction=True,
+                    is_boundary=True,
+                )
+            )
+
+        return report
 
     async def _himport_prepare_pipeline(self, conn, commands):
         """Delegate to the shared async HIMPORT executor."""
